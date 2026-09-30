@@ -10,7 +10,7 @@
    (원본 주문 데이터를 브라우저로 보내지 않기 위해서예요)
    ===================================================================== */
 
-const REQUIRED = ["설정", "날짜", "최대 사용 칸 수"];
+const REQUIRED = ["날짜", "최대 사용 칸 수"];   // "설정" 또는 "변형" 둘 중 하나만 있으면 됨(아래서 따로 검사)
 const FIELD = {
   scenario: "시나리오", config: "설정", date: "날짜",
   maxcells: "최대 사용 칸 수", avgcells: "평균 사용 칸 수(시간가중)",
@@ -117,6 +117,19 @@ function shortLabel(id) {
   return s;
 }
 
+/* 예전 버전(V0~V5, R1~R7, L1, L2 같은 고정 이름) 파일을 새 규칙(설정 id)으로 자동 변환.
+   L1(그리디+개선탐색)은 지금 체계에 대응하는 게 없어서 변환 못 함(제외됨). */
+const LEGACY_ID_MAP = {
+  "baseline": "sort:code", "R1_코드순": "sort:code",
+  "R2_수량많은순": "sort:qty_desc", "R3_수량적은순": "sort:qty_asc",
+  "R4_생산시간짧은순": "sort:time_asc", "R5_주문많이걸린순": "sort:demand_desc",
+  "R6_칸적은순": "sort:cells_asc", "R7_무작위": "sort:random",
+  "V0_이름순": "greedy:count:none:none", "V1_생산시간짧은": "greedy:count:time_asc:none",
+  "V2_수요많은": "greedy:count:demand_desc:none", "V3_칸적은": "greedy:count:cells_asc:none",
+  "V4_DD가중2": "greedy:count_ddweighted:none:none", "V5_부분점수": "greedy:count_partial:none:none",
+  "L2_유전알고리즘": "search:genetic",
+};
+
 /* ---------- CSV 읽기 ---------- */
 function parseCSV(text) {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
@@ -138,10 +151,10 @@ function parseCSV(text) {
 
 function decodeBuffer(buf) {
   let t = new TextDecoder("utf-8").decode(buf);
-  if (!t.includes("설정") || t.includes("\uFFFD")) {
+  if ((!t.includes("설정") && !t.includes("변형")) || t.includes("\uFFFD")) {
     try {
       const k = new TextDecoder("euc-kr").decode(buf);
-      if (k.includes("설정")) t = k;
+      if (k.includes("설정") || k.includes("변형")) t = k;
     } catch (e) { /* 무시 */ }
   }
   return t;
@@ -151,19 +164,29 @@ function normalizeRows(table) {
   if (!table.length) return { rows: [], error: "빈 파일입니다." };
   const header = table[0].map((h) => h.trim());
   const missing = REQUIRED.filter((c) => !header.includes(c));
-  if (missing.length) {
-    return { rows: [], error: `필수 열이 없습니다: ${missing.join(", ")}. ` +
+  const hasNew = header.includes("설정"), hasLegacy = header.includes("변형");
+  if (missing.length || (!hasNew && !hasLegacy)) {
+    const allMissing = [...missing, ...(hasNew || hasLegacy ? [] : ["설정(또는 변형)"])];
+    return { rows: [], error: `필수 열이 없습니다: ${allMissing.join(", ")}. ` +
       `export_builder.py 로 만든 results.csv 인지 확인하세요. (찾은 열: ${header.slice(0, 6).join(", ")}…)` };
   }
   const col = {};
   for (const [k, name] of Object.entries(FIELD)) col[k] = header.indexOf(name);
+  if (!hasNew) col.config = header.indexOf("변형");   // 예전 파일: "변형" 열을 config 자리에서 읽음
+
   const rows = [];
+  const droppedIds = new Set();
   for (let i = 1; i < table.length; i++) {
     const r = table[i];
     const get = (k) => (col[k] >= 0 ? r[col[k]] : undefined);
-    const config = String(get("config") ?? "").trim();
+    let config = String(get("config") ?? "").trim();
     const date = String(get("date") ?? "").trim().slice(0, 10);
     if (!config || !date) continue;
+    if (!hasNew) {   // 예전 이름(V0_이름순 등)이면 지금 규칙 체계의 id로 변환
+      const mapped = LEGACY_ID_MAP[config];
+      if (!mapped) { droppedIds.add(config); continue; }
+      config = mapped;
+    }
     rows.push({
       scenario: (String(get("scenario") ?? "").trim()) || "기본",
       config, date,
@@ -172,7 +195,8 @@ function normalizeRows(table) {
       obj3: num(get("obj3")), r50: num(get("r50")), idle: num(get("idle")),
     });
   }
-  return rows.length ? { rows } : { rows: [], error: "읽을 수 있는 데이터 행이 없습니다." };
+  if (!rows.length) return { rows: [], error: "읽을 수 있는 데이터 행이 없습니다." };
+  return { rows, legacy: !hasNew, dropped: [...droppedIds] };
 }
 
 /* ---------- 집계 / 순위 ---------- */
@@ -353,7 +377,12 @@ function initUI() {
     S.items = PRESETS.filter((p) => p.config === null || S.allConfigsInData.has(p.config))
       .map((p) => ({ id: p.name, label: p.label, config: p.config, fixed: true, help: p.help }));
     msg.className = "load-msg ok";
-    msg.textContent = `${source} — ${S.rows.length.toLocaleString()}행, 설정 ${S.allConfigsInData.size}개, 날짜 ${S.allDates.length}일, 시나리오 ${S.scenarios.length}개`;
+    let m = `${source} — ${S.rows.length.toLocaleString()}행, 설정 ${S.allConfigsInData.size}개, 날짜 ${S.allDates.length}일, 시나리오 ${S.scenarios.length}개`;
+    if (parsed.legacy) {
+      m += `\n예전 방식(변형 이름) 파일이라 지금 규칙 체계로 자동 변환했어요.`;
+      if (parsed.dropped.length) m += ` ${parsed.dropped.join(", ")}은(는) 지금 체계에 대응하는 게 없어 제외됐어요.`;
+    }
+    msg.textContent = m;
     buildControls(); render();
     return true;
   }
